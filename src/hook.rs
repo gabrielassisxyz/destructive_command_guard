@@ -3768,6 +3768,8 @@ mod tests {
             Some("core.git"),
             Some("reset-hard"),
             None,
+            None,
+            false,
         );
 
         assert!(message.contains("Reason: destructive"));
@@ -3789,6 +3791,8 @@ mod tests {
             Some("core.git"),
             Some("reset-hard"),
             None,
+            None,
+            false,
         );
         assert!(
             short_message.contains(short),
@@ -3803,6 +3807,8 @@ mod tests {
             Some("core.filesystem"),
             Some("redirect-truncate"),
             None,
+            None,
+            false,
         );
 
         assert!(
@@ -3830,6 +3836,8 @@ mod tests {
             Some("core.filesystem"),
             Some("rm-rf"),
             Some("137527"),
+            None,
+            false,
         );
 
         assert!(
@@ -3854,6 +3862,8 @@ mod tests {
             Some("core.git"),
             Some("reset-hard"),
             None,
+            None,
+            false,
         );
 
         assert!(
@@ -3877,6 +3887,8 @@ mod tests {
                 Some("core.filesystem"),
                 Some("rm-rf"),
                 None,
+                None,
+                false,
             ),
             format_review_message(
                 command,
@@ -3884,6 +3896,8 @@ mod tests {
                 None,
                 Some("core.filesystem"),
                 Some("rm-rf"),
+                None,
+                false,
             ),
         ] {
             assert_eq!(
@@ -3897,6 +3911,139 @@ mod tests {
                 "the bare Command: echo is redundant with the Tip: line"
             );
         }
+    }
+
+    /// bd-jdob: a destructive token can sit anywhere in a large payload, not
+    /// just at the start — a heredoc whose *prose* quotes the offending
+    /// command deep inside it. The window must be centered on the match, not
+    /// on byte 0, or the caller sees 120 bytes of unrelated heredoc filler
+    /// instead of the token that actually fired the rule.
+    #[test]
+    fn explain_hint_windows_around_a_matched_span_deep_inside_a_heredoc() {
+        let filler_before = "x".repeat(5_000);
+        let filler_after = "y".repeat(5_000);
+        let command = format!(
+            "cat > notes.md <<'EOF'\n{filler_before}rm -rf /{filler_after}\nEOF\n"
+        );
+        let match_start = command.find("rm -rf /").expect("marker present");
+        let span = MatchSpan {
+            start: match_start,
+            end: match_start + "rm -rf /".len(),
+        };
+
+        let message = format_denial_message(
+            &command,
+            "destructive",
+            None,
+            Some("core.filesystem"),
+            Some("rm-rf"),
+            None,
+            Some(&span),
+            false,
+        );
+
+        assert!(
+            message.contains("rm -rf /"),
+            "the matched token must survive windowing: {message}"
+        );
+        assert!(
+            message.len() < 2_000,
+            "message must stay bounded regardless of payload size, got {} bytes for a {} byte command",
+            message.len(),
+            command.len()
+        );
+        assert!(
+            message.contains("bytes elided"),
+            "windowed output must report what it dropped: {message}"
+        );
+        // The verdict itself survives windowing untouched (scope: echo only).
+        assert!(message.contains("Rule: core.filesystem:rm-rf"));
+        assert!(message.contains("Reason: destructive"));
+    }
+
+    /// bd-jdob: a single long argument with no newlines (e.g. an inlined
+    /// path or URL) must window the same way a heredoc does.
+    #[test]
+    fn explain_hint_windows_a_long_single_line_argument() {
+        let long_path = format!("/data/{}/target", "segment-".repeat(200));
+        let command = format!("rm -rf {long_path}");
+        let span = MatchSpan { start: 0, end: 6 }; // "rm -rf"
+
+        let message = format_denial_message(
+            &command,
+            "destructive",
+            None,
+            Some("core.filesystem"),
+            Some("rm-rf"),
+            None,
+            Some(&span),
+            false,
+        );
+
+        assert!(message.contains("rm -rf"));
+        assert!(
+            message.len() < 2_000,
+            "message must stay bounded for a long single-line argument, got {} bytes",
+            message.len()
+        );
+        assert!(message.contains("bytes elided"));
+    }
+
+    /// bd-jdob: a command substitution can carry an arbitrarily large
+    /// payload inline (no heredoc, no newlines) — same bound applies.
+    #[test]
+    fn explain_hint_windows_a_command_substitution() {
+        let huge_inner = "a".repeat(20_000);
+        let command = format!("rm -rf $(echo {huge_inner})");
+        let span = MatchSpan { start: 0, end: 6 }; // "rm -rf"
+
+        let message = format_denial_message(
+            &command,
+            "destructive",
+            None,
+            Some("core.filesystem"),
+            Some("rm-rf"),
+            None,
+            Some(&span),
+            false,
+        );
+
+        assert!(message.contains("rm -rf"));
+        assert!(
+            message.len() < 2_000,
+            "message must stay bounded for a command substitution payload, got {} bytes for a {} byte command",
+            message.len(),
+            command.len()
+        );
+        assert!(message.contains("bytes elided"));
+    }
+
+    /// bd-jdob: `--verbose`/`config.general.verbose` is the escape hatch —
+    /// it must restore the exact unbounded echo regardless of size.
+    #[test]
+    fn format_denial_message_verbose_restores_the_full_echo() {
+        let huge = "cat > notes.md <<'EOF'\n".to_string() + &"x".repeat(50_000) + "\nEOF\n";
+
+        let message = format_denial_message(
+            &huge,
+            "destructive",
+            None,
+            Some("core.filesystem"),
+            Some("redirect-truncate"),
+            None,
+            None,
+            true, // verbose
+        );
+
+        let escaped = huge.replace('"', "\\\"");
+        assert!(
+            message.contains(&escaped),
+            "verbose must restore the full command verbatim"
+        );
+        assert!(
+            !message.contains("bytes elided"),
+            "verbose must not report an elision that did not happen: {message}"
+        );
     }
 
     #[test]
@@ -4102,6 +4249,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -4337,6 +4485,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -4691,6 +4840,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -4943,6 +5093,7 @@ mod tests {
             Some(0.95),
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -5056,6 +5207,7 @@ mod tests {
             Some(0.95),
             &[],
             None,
+            false,
         );
 
         let json: serde_json::Value = serde_json::from_slice(&stdout)
@@ -5124,6 +5276,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -5161,6 +5314,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -5327,6 +5481,7 @@ mod tests {
                 Some(0.99),
                 &[],
                 None,
+                false,
             );
 
             assert!(!stdout.is_empty(), "{protocol:?} must emit a decision");

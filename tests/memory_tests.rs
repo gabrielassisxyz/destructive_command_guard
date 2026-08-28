@@ -530,6 +530,7 @@ fn memory_codex_deny_pipeline() {
                             None,
                             pi.map_or(&[], |p| p.suggestions),
                             None,
+                            false,
                         );
                         black_box(&stdout_buf);
                         black_box(&stderr_buf);
@@ -577,6 +578,7 @@ fn memory_codex_deny_output_formatting() {
                 Some(0.95),
                 &[],
                 None,
+                false,
             );
             black_box(&stdout_buf);
             black_box(&stderr_buf);
@@ -648,6 +650,7 @@ fn memory_codex_vs_claude_deny_parity() {
                             None,
                             pi.map_or(&[], |p| p.suggestions),
                             None,
+                            false,
                         );
                         black_box(&stdout_buf);
                         black_box(&stderr_buf);
