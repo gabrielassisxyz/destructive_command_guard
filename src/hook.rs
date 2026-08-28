@@ -3922,9 +3922,8 @@ mod tests {
     fn explain_hint_windows_around_a_matched_span_deep_inside_a_heredoc() {
         let filler_before = "x".repeat(5_000);
         let filler_after = "y".repeat(5_000);
-        let command = format!(
-            "cat > notes.md <<'EOF'\n{filler_before}rm -rf /{filler_after}\nEOF\n"
-        );
+        let command =
+            format!("cat > notes.md <<'EOF'\n{filler_before}rm -rf /{filler_after}\nEOF\n");
         let match_start = command.find("rm -rf /").expect("marker present");
         let span = MatchSpan {
             start: match_start,

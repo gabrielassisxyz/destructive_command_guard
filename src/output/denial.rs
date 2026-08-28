@@ -210,7 +210,10 @@ impl DenialBox {
         // size of its payload while the other three renderers were already
         // capped to terminal width.
         let highlighted = format_highlighted_command(&self.command, &self.span, false, width);
-        lines.push(format!("[dim]Command:[/]  [bold]{}[/]", self.command));
+        lines.push(format!(
+            "[dim]Command:[/]  [bold]{}[/]",
+            highlighted.command_line
+        ));
         lines.push(format!("[dim]{}[/]", highlighted.caret_line));
         if let Some(label) = &highlighted.label_line {
             lines.push(format!("[dim]{label}[/]"));
@@ -1697,7 +1700,12 @@ mod tests {
     fn test_denial_box_rich_render_stays_bounded_for_huge_command() {
         let huge = "cat > notes.md <<'EOF'\n".to_string() + &"x".repeat(50_000) + "\nEOF\n";
         let span = HighlightSpan::new(23, 24); // points at the first payload byte
-        let denial = DenialBox::new(&huge, span, "core.filesystem:redirect-truncate", Severity::Critical);
+        let denial = DenialBox::new(
+            &huge,
+            span,
+            "core.filesystem:redirect-truncate",
+            Severity::Critical,
+        );
 
         let theme = Theme {
             border_style: BorderStyle::Unicode,
@@ -1715,6 +1723,38 @@ mod tests {
         assert!(
             !output.contains(&"x".repeat(1000)),
             "rich render must not reprint the payload wholesale"
+        );
+    }
+
+    /// bd-jdob: the panel renderer truncates any over-long line to the
+    /// terminal width on its own (`adjust_line_length` in rich_rust), so a
+    /// byte-length assertion alone cannot tell a windowed `Command:` line
+    /// from an unwindowed one that merely got cropped by that side effect —
+    /// both come out short. What distinguishes them is *which* bytes survive:
+    /// naive left-to-right cropping keeps only the prefix, so a match buried
+    /// deep in a huge payload would silently vanish; windowing centers on
+    /// the match span, so it survives. Placing the match far from byte 0
+    /// makes that difference observable.
+    #[test]
+    #[cfg(feature = "rich-output")]
+    fn test_denial_box_rich_render_centers_on_a_match_buried_deep_in_the_payload() {
+        let prefix = "x".repeat(25_000);
+        let suffix = "y".repeat(25_000);
+        let huge = format!("cat > notes.md <<'EOF'\n{prefix}rm -rf /{suffix}\nEOF\n");
+        let match_start = huge.find("rm -rf /").expect("marker present");
+        let span = HighlightSpan::new(match_start, match_start + "rm -rf /".len());
+        let denial = DenialBox::new(&huge, span, "core.filesystem:rm-rf", Severity::Critical);
+
+        let theme = Theme {
+            border_style: BorderStyle::Unicode,
+            colors_enabled: false,
+            ..Default::default()
+        };
+        let output = denial.render_rich(&theme);
+
+        assert!(
+            output.contains("rm -rf /"),
+            "the matched token must survive windowing rather than being cropped away: {output}"
         );
     }
 
