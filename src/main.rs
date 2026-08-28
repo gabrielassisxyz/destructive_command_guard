@@ -372,6 +372,7 @@ fn handle_unparseable_hook_input(
         None,
         &[],
         None,
+        config.general.verbose,
     );
 }
 
@@ -1275,6 +1276,7 @@ fn publish_decisive_response(
                     None, // confidence not yet available in PatternMatch
                     info.suggestions,
                     branch_ctx,
+                    ctx.config.general.verbose,
                 );
             } else {
                 hook::output_denial_for_protocol(
@@ -1290,6 +1292,7 @@ fn publish_decisive_response(
                     None, // confidence not yet available in PatternMatch
                     info.suggestions,
                     branch_ctx,
+                    ctx.config.general.verbose,
                 );
             }
 

@@ -21433,9 +21433,10 @@ fn filesystem_pre_rm_pattern_excluding_dynamic(name: Option<&str>) -> bool {
 /// `NAME=` a literal value; no preceding segment may reassign the name or
 /// start with a builtin that can mutate parent-shell variables; every trailing
 /// redirect in the segment must be a static fd duplication (`2>&1`); and the
-/// resolved path must be a tmp-family or relative path with no `..` traversal
-/// — the shapes a direct literal redirect already passes. Anything else keeps
-/// today's fail-closed denial.
+/// resolved path must land where a direct literal redirect to that same path
+/// already would (tmp-family, or any other path outside
+/// `redirect-truncate-root-home`'s sensitive prefixes, with no `..`
+/// traversal). Anything else keeps today's fail-closed denial.
 fn statically_safe_variable_redirect(
     source: &str,
     segment_ranges: &[(usize, usize)],
@@ -21854,9 +21855,24 @@ fn value_expands_when_unquoted(value: &str) -> bool {
     value.contains(['*', '?', '['])
 }
 
-/// Would a *direct literal* redirect to this path be allowed today? Only the
-/// tmp family and traversal-free relative paths qualify; everything else
-/// keeps the fail-closed dynamic-path denial.
+/// Top-level directories `redirect-truncate-root-home` refuses for a
+/// spelled-out literal target. Kept in sync with that rule's regex
+/// (`src/packs/core/filesystem.rs`) so a proven `$VAR` redirect target is
+/// judged by the identical prefix set a literal target would be (bd-mzc9);
+/// letting this list drift from the regex would reopen the gap where
+/// `SP=<literal>; cmd > $SP/f` and `cmd > <literal>/f` reach different
+/// verdicts.
+const ROOT_HOME_SENSITIVE_TOP_LEVEL_DIRS: &[&str] = &[
+    "etc", "usr", "bin", "sbin", "root", "boot", "lib", "lib64", "var", "home", "Users", "sys",
+    "proc", "dev", "opt",
+];
+
+/// Would a *direct literal* redirect to this path be allowed today? The tmp
+/// family is always benign; any other absolute path is exactly as benign as
+/// typing it would be — i.e. benign unless it lands under one of
+/// `redirect-truncate-root-home`'s sensitive top-level directories or is the
+/// filesystem root itself — and traversal-free relative paths qualify too.
+/// Everything else keeps the fail-closed dynamic-path denial.
 fn resolved_redirect_target_is_benign(path: &str) -> bool {
     let no_traversal = |p: &str| !p.split('/').any(|component| component == "..");
     for prefix in ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"] {
@@ -21864,7 +21880,13 @@ fn resolved_redirect_target_is_benign(path: &str) -> bool {
             return !rest.is_empty() && no_traversal(rest);
         }
     }
-    !path.is_empty() && !path.starts_with(['/', '~', '-']) && no_traversal(path)
+    if let Some(rest) = path.strip_prefix('/') {
+        let first_component = rest.split('/').next().unwrap_or("");
+        let sensitive =
+            rest.is_empty() || ROOT_HOME_SENSITIVE_TOP_LEVEL_DIRS.contains(&first_component);
+        return !sensitive && no_traversal(rest);
+    }
+    !path.is_empty() && !path.starts_with(['~', '-']) && no_traversal(path)
 }
 
 fn filesystem_non_pre_rm_non_redirect_pattern(name: Option<&str>) -> bool {
@@ -31166,6 +31188,126 @@ mod tests {
                 result.is_denied(),
                 "unproven or sensitive redirect target must stay denied: {command:?}: {:?}",
                 result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn bd_mzc9_scratch_root_prefix_matches_direct_literal_redirect_verdict() {
+        // bd-mzc9: a redirect into a caller-handed scratch directory outside
+        // the tmp family (an agent harness's own scratch mount, not `/tmp`)
+        // was denied only because the target arrived through a variable —
+        // the same literal path typed directly was already allowed. The
+        // denial tests come first: each is how this narrowing could become a
+        // hole.
+
+        // Substitution-assigned: the value is not provably literal at all.
+        for command in [
+            "SP=$(pwd); echo hi > $SP/out.txt",
+            "SP=$(dirname /a/b); echo hi > $SP/out.txt",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "substitution-assigned variable must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Environment-inherited: no assignment exists in this command at all,
+        // so the live value is whatever the ambient environment holds.
+        {
+            let command = "echo hi > $SP/out.txt";
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "environment-inherited variable must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Reassigned between binding and use: both bindings are literal and
+        // both would individually be benign, but which one is live at the
+        // redirect is ambiguous, so the proof must still refuse.
+        {
+            let command = "SP=/mnt/scratch/a; SP=/mnt/scratch/b; echo hi > $SP/out.txt";
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "reassigned variable must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Laundering shape: an allowed scratch prefix must not smuggle a
+        // second, unrelated destructive statement riding the same binding.
+        {
+            let command = "SP=/mnt/build/claude-tmp/claude-1000/x/scratchpad; echo hi > $SP/out.txt; rm -rf /";
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "a second destructive statement must not ride an allowed prefix: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // The allow case: a variable assigned a literal path in the same
+        // command, used as a redirect target, must reach the identical
+        // verdict as spelling that same literal path out directly — for a
+        // benign scratch root and for a sensitive one alike.
+        let cases = [
+            (
+                "SP=/mnt/build/claude-tmp/claude-1000/x/scratchpad",
+                "/mnt/build/claude-tmp/claude-1000/x/scratchpad",
+                true,
+            ),
+            ("SP=/etc/scratch", "/etc/scratch", false),
+        ];
+        for (assignment, literal_dir, expect_allowed) in cases {
+            let via_variable = format!("{assignment}; some-cmd > $SP/out.txt 2>&1");
+            let via_literal = format!("some-cmd > {literal_dir}/out.txt 2>&1");
+            let variable_result = evaluate_with_pack_ids_in_dialect(
+                &via_variable,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            let literal_result = evaluate_with_pack_ids_in_dialect(
+                &via_literal,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert_eq!(
+                variable_result.is_allowed(),
+                expect_allowed,
+                "{via_variable:?}: {:?}",
+                variable_result.pattern_info
+            );
+            assert_eq!(
+                literal_result.is_allowed(),
+                expect_allowed,
+                "{via_literal:?}: {:?}",
+                literal_result.pattern_info
+            );
+            assert_eq!(
+                variable_result.is_allowed(),
+                literal_result.is_allowed(),
+                "variable and literal redirect to the same path must agree: {via_variable:?} vs {via_literal:?}"
             );
         }
     }
