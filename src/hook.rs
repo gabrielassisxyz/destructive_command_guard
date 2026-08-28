@@ -1594,22 +1594,79 @@ pub fn configure_colors() {
 /// ordinary commands are untouched and stay copy-pasteable.
 const MAX_EXPLAIN_HINT_COMMAND: usize = 400;
 
+/// Bytes of surrounding context kept on each side of the matched span once a
+/// command exceeds [`MAX_EXPLAIN_HINT_COMMAND`] and the tip line falls back
+/// to a window instead of the command whole.
+const EXPLAIN_HINT_CONTEXT_BYTES: usize = 120;
+
+/// Carve a byte window out of `command`, centered on `span` with up to
+/// `context_bytes` of surrounding text on each side, widened outward as
+/// needed to land on UTF-8 character boundaries. Returns the window (with a
+/// `...` marker on any side that was cut) and the number of bytes left out.
+///
+/// Unlike [`crate::evaluator::window_command`] (which sizes its window in
+/// characters to fit a terminal column count for the stderr caret display),
+/// this counts bytes directly: the caller needs an exact "N bytes elided"
+/// count, and byte offsets are what `MatchSpan` and `command.len()` already
+/// use, so there is nothing to convert.
+fn window_explain_hint(command: &str, span: MatchSpan, context_bytes: usize) -> (String, usize) {
+    let total = command.len();
+    let match_start = span.start.min(total);
+    let match_end = span.end.min(total).max(match_start);
+
+    let want_start = match_start.saturating_sub(context_bytes);
+    let want_end = (match_end + context_bytes).min(total);
+
+    // Widen outward (never shrink) so the window never splits a character.
+    let mut start = want_start;
+    while start > 0 && !command.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = want_end;
+    while end < total && !command.is_char_boundary(end) {
+        end += 1;
+    }
+
+    let mut window = String::with_capacity(end - start + 6);
+    if start > 0 {
+        window.push_str("...");
+    }
+    window.push_str(&command[start..end]);
+    if end < total {
+        window.push_str("...");
+    }
+
+    (window, total - (end - start))
+}
+
 /// Format the explain hint line for copy-paste convenience.
-fn format_explain_hint(command: &str) -> String {
+///
+/// `verbose` restores the unbounded echo regardless of length — the escape
+/// hatch promised by the `-v`/`--verbose` flag (`Cli::verbose`,
+/// `config.general.verbose`) for callers debugging at a terminal.
+fn format_explain_hint(command: &str, matched_span: Option<&MatchSpan>, verbose: bool) -> String {
     // Escape double quotes in command for safe copy-paste
     let escaped = command.replace('"', "\\\"");
-    if escaped.len() <= MAX_EXPLAIN_HINT_COMMAND {
+    if verbose || escaped.len() <= MAX_EXPLAIN_HINT_COMMAND {
         return format!("Tip: dcg explain \"{escaped}\"");
     }
 
     // Past the cap the tip cannot be copy-pasteable anyway, so spend the
-    // bytes on the head of the command and say how much was dropped. The
-    // elided byte count is the useful signal here, not the elided bytes.
-    let head = truncate_for_display(&escaped, MAX_EXPLAIN_HINT_COMMAND);
+    // bytes on the token that actually matched and its immediate context —
+    // for a heredoc or a long PR body the offending token can sit anywhere
+    // in the payload, not just at the start of the command (#339 follow-up).
     let total = command.len();
-    let elided = total.saturating_sub(MAX_EXPLAIN_HINT_COMMAND);
+    let span = matched_span.map_or(MatchSpan { start: 0, end: 0 }, |s| {
+        let start = s.start.min(total);
+        MatchSpan {
+            start,
+            end: s.end.clamp(start, total),
+        }
+    });
+    let (window, elided) = window_explain_hint(command, span, EXPLAIN_HINT_CONTEXT_BYTES);
+    let escaped_window = window.replace('"', "\\\"");
     format!(
-        "Tip: dcg explain \"{head}\"\n\
+        "Tip: dcg explain \"{escaped_window}\"\n\
          (command truncated for this report: {elided} of {total} bytes elided; \
          rerun `dcg explain` against the full command for the complete report)"
     )
@@ -1674,6 +1731,7 @@ fn format_explanation_block(explanation: &str) -> String {
 /// approves the single command, which is strictly safer than the fallback of
 /// having them run the destructive command by hand.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn format_denial_message(
     command: &str,
     reason: &str,
@@ -1681,6 +1739,8 @@ pub fn format_denial_message(
     pack: Option<&str>,
     pattern: Option<&str>,
     allow_once_code: Option<&str>,
+    matched_span: Option<&MatchSpan>,
+    verbose: bool,
 ) -> String {
     let mut message = format_matched_message(
         "BLOCKED by dcg",
@@ -1690,6 +1750,8 @@ pub fn format_denial_message(
         pack,
         pattern,
         "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
+        matched_span,
+        verbose,
     );
     if let Some(code) = allow_once_code {
         use std::fmt::Write as _;
@@ -1709,6 +1771,8 @@ pub fn format_review_message(
     explanation: Option<&str>,
     pack: Option<&str>,
     pattern: Option<&str>,
+    matched_span: Option<&MatchSpan>,
+    verbose: bool,
 ) -> String {
     format_matched_message(
         "APPROVAL REQUIRED by dcg",
@@ -1718,9 +1782,12 @@ pub fn format_review_message(
         pack,
         pattern,
         "Approve this command only after reviewing the operation and its target. Denying it keeps the command blocked.",
+        matched_span,
+        verbose,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_matched_message(
     heading: &str,
     command: &str,
@@ -1729,8 +1796,10 @@ fn format_matched_message(
     pack: Option<&str>,
     pattern: Option<&str>,
     instruction: &str,
+    matched_span: Option<&MatchSpan>,
+    verbose: bool,
 ) -> String {
-    let explain_hint = format_explain_hint(command);
+    let explain_hint = format_explain_hint(command, matched_span, verbose);
     let rule_id = build_rule_id(pack, pattern);
     let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
     let explanation_block = format_explanation_block(&explanation_text);
@@ -2014,6 +2083,7 @@ pub fn write_denial_to(
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
     branch_context: Option<&crate::evaluator::BranchContext>,
+    verbose: bool,
 ) {
     let allow_once_code = allow_once.map(|info| info.code.as_str());
     let warning_audience = match protocol {
@@ -2057,6 +2127,8 @@ pub fn write_denial_to(
         pack,
         pattern,
         reason_allow_once_code,
+        matched_span,
+        verbose,
     );
     let rule_id = build_rule_id(pack, pattern);
     let remediation = allow_once.map(|info| {
@@ -2235,6 +2307,7 @@ pub fn write_review_request_to(
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
     branch_context: Option<&crate::evaluator::BranchContext>,
+    verbose: bool,
 ) {
     if !matches!(
         protocol,
@@ -2255,6 +2328,7 @@ pub fn write_review_request_to(
             confidence,
             pattern_suggestions,
             branch_context,
+            verbose,
         );
         return;
     }
@@ -2274,7 +2348,15 @@ pub fn write_review_request_to(
         WarningAudience::HumanOperator,
     );
 
-    let message = format_review_message(command, reason, explanation, pack, pattern);
+    let message = format_review_message(
+        command,
+        reason,
+        explanation,
+        pack,
+        pattern,
+        matched_span,
+        verbose,
+    );
     match protocol {
         HookProtocol::ClaudeCompatible => {
             let rule_id = build_rule_id(pack, pattern);
@@ -2335,6 +2417,7 @@ pub fn output_denial_for_protocol(
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
     branch_context: Option<&crate::evaluator::BranchContext>,
+    verbose: bool,
 ) {
     let out = io::stdout();
     let mut out_handle = out.lock();
@@ -2355,6 +2438,7 @@ pub fn output_denial_for_protocol(
         confidence,
         pattern_suggestions,
         branch_context,
+        verbose,
     );
 }
 
@@ -2375,6 +2459,7 @@ pub fn output_review_request_for_protocol(
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
     branch_context: Option<&crate::evaluator::BranchContext>,
+    verbose: bool,
 ) {
     let out = io::stdout();
     let mut out_handle = out.lock();
@@ -2395,6 +2480,7 @@ pub fn output_review_request_for_protocol(
         confidence,
         pattern_suggestions,
         branch_context,
+        verbose,
     );
 }
 
@@ -2413,6 +2499,7 @@ pub fn output_denial(
     severity: Option<crate::packs::Severity>,
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
+    verbose: bool,
 ) {
     output_denial_for_protocol(
         HookProtocol::ClaudeCompatible,
@@ -2427,6 +2514,7 @@ pub fn output_denial(
         confidence,
         pattern_suggestions,
         None,
+        verbose,
     );
 }
 
@@ -3680,6 +3768,8 @@ mod tests {
             Some("core.git"),
             Some("reset-hard"),
             None,
+            None,
+            false,
         );
 
         assert!(message.contains("Reason: destructive"));
@@ -3701,6 +3791,8 @@ mod tests {
             Some("core.git"),
             Some("reset-hard"),
             None,
+            None,
+            false,
         );
         assert!(
             short_message.contains(short),
@@ -3715,6 +3807,8 @@ mod tests {
             Some("core.filesystem"),
             Some("redirect-truncate"),
             None,
+            None,
+            false,
         );
 
         assert!(
@@ -3742,6 +3836,8 @@ mod tests {
             Some("core.filesystem"),
             Some("rm-rf"),
             Some("137527"),
+            None,
+            false,
         );
 
         assert!(
@@ -3766,6 +3862,8 @@ mod tests {
             Some("core.git"),
             Some("reset-hard"),
             None,
+            None,
+            false,
         );
 
         assert!(
@@ -3789,6 +3887,8 @@ mod tests {
                 Some("core.filesystem"),
                 Some("rm-rf"),
                 None,
+                None,
+                false,
             ),
             format_review_message(
                 command,
@@ -3796,6 +3896,8 @@ mod tests {
                 None,
                 Some("core.filesystem"),
                 Some("rm-rf"),
+                None,
+                false,
             ),
         ] {
             assert_eq!(
@@ -3809,6 +3911,138 @@ mod tests {
                 "the bare Command: echo is redundant with the Tip: line"
             );
         }
+    }
+
+    /// bd-jdob: a destructive token can sit anywhere in a large payload, not
+    /// just at the start — a heredoc whose *prose* quotes the offending
+    /// command deep inside it. The window must be centered on the match, not
+    /// on byte 0, or the caller sees 120 bytes of unrelated heredoc filler
+    /// instead of the token that actually fired the rule.
+    #[test]
+    fn explain_hint_windows_around_a_matched_span_deep_inside_a_heredoc() {
+        let filler_before = "x".repeat(5_000);
+        let filler_after = "y".repeat(5_000);
+        let command =
+            format!("cat > notes.md <<'EOF'\n{filler_before}rm -rf /{filler_after}\nEOF\n");
+        let match_start = command.find("rm -rf /").expect("marker present");
+        let span = MatchSpan {
+            start: match_start,
+            end: match_start + "rm -rf /".len(),
+        };
+
+        let message = format_denial_message(
+            &command,
+            "destructive",
+            None,
+            Some("core.filesystem"),
+            Some("rm-rf"),
+            None,
+            Some(&span),
+            false,
+        );
+
+        assert!(
+            message.contains("rm -rf /"),
+            "the matched token must survive windowing: {message}"
+        );
+        assert!(
+            message.len() < 2_000,
+            "message must stay bounded regardless of payload size, got {} bytes for a {} byte command",
+            message.len(),
+            command.len()
+        );
+        assert!(
+            message.contains("bytes elided"),
+            "windowed output must report what it dropped: {message}"
+        );
+        // The verdict itself survives windowing untouched (scope: echo only).
+        assert!(message.contains("Rule: core.filesystem:rm-rf"));
+        assert!(message.contains("Reason: destructive"));
+    }
+
+    /// bd-jdob: a single long argument with no newlines (e.g. an inlined
+    /// path or URL) must window the same way a heredoc does.
+    #[test]
+    fn explain_hint_windows_a_long_single_line_argument() {
+        let long_path = format!("/data/{}/target", "segment-".repeat(200));
+        let command = format!("rm -rf {long_path}");
+        let span = MatchSpan { start: 0, end: 6 }; // "rm -rf"
+
+        let message = format_denial_message(
+            &command,
+            "destructive",
+            None,
+            Some("core.filesystem"),
+            Some("rm-rf"),
+            None,
+            Some(&span),
+            false,
+        );
+
+        assert!(message.contains("rm -rf"));
+        assert!(
+            message.len() < 2_000,
+            "message must stay bounded for a long single-line argument, got {} bytes",
+            message.len()
+        );
+        assert!(message.contains("bytes elided"));
+    }
+
+    /// bd-jdob: a command substitution can carry an arbitrarily large
+    /// payload inline (no heredoc, no newlines) — same bound applies.
+    #[test]
+    fn explain_hint_windows_a_command_substitution() {
+        let huge_inner = "a".repeat(20_000);
+        let command = format!("rm -rf $(echo {huge_inner})");
+        let span = MatchSpan { start: 0, end: 6 }; // "rm -rf"
+
+        let message = format_denial_message(
+            &command,
+            "destructive",
+            None,
+            Some("core.filesystem"),
+            Some("rm-rf"),
+            None,
+            Some(&span),
+            false,
+        );
+
+        assert!(message.contains("rm -rf"));
+        assert!(
+            message.len() < 2_000,
+            "message must stay bounded for a command substitution payload, got {} bytes for a {} byte command",
+            message.len(),
+            command.len()
+        );
+        assert!(message.contains("bytes elided"));
+    }
+
+    /// bd-jdob: `--verbose`/`config.general.verbose` is the escape hatch —
+    /// it must restore the exact unbounded echo regardless of size.
+    #[test]
+    fn format_denial_message_verbose_restores_the_full_echo() {
+        let huge = "cat > notes.md <<'EOF'\n".to_string() + &"x".repeat(50_000) + "\nEOF\n";
+
+        let message = format_denial_message(
+            &huge,
+            "destructive",
+            None,
+            Some("core.filesystem"),
+            Some("redirect-truncate"),
+            None,
+            None,
+            true, // verbose
+        );
+
+        let escaped = huge.replace('"', "\\\"");
+        assert!(
+            message.contains(&escaped),
+            "verbose must restore the full command verbatim"
+        );
+        assert!(
+            !message.contains("bytes elided"),
+            "verbose must not report an elision that did not happen: {message}"
+        );
     }
 
     #[test]
@@ -4014,6 +4248,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -4249,6 +4484,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -4603,6 +4839,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -4855,6 +5092,7 @@ mod tests {
             Some(0.95),
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -4968,6 +5206,7 @@ mod tests {
             Some(0.95),
             &[],
             None,
+            false,
         );
 
         let json: serde_json::Value = serde_json::from_slice(&stdout)
@@ -5036,6 +5275,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -5073,6 +5313,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         );
 
         let stdout_str = String::from_utf8_lossy(&stdout);
@@ -5239,6 +5480,7 @@ mod tests {
                 Some(0.99),
                 &[],
                 None,
+                false,
             );
 
             assert!(!stdout.is_empty(), "{protocol:?} must emit a decision");
